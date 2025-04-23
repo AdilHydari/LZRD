@@ -1,0 +1,10 @@
+[package]
+name = "range_coder"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+[[bin]]
+name = "range_coder"
+path = "range_coder.rs"
