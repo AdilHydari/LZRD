@@ -56,10 +56,9 @@ struct ModelO1 {
 //---------------------------------------------------------------------------
 // LZRC Constants
 //---------------------------------------------------------------------------
-static constexpr uint32_t WIN_SIZE      = 1024 * 1024; // 1 MiB sliding window
-static constexpr uint32_t HASH_SIZE     = 1 << 16;   // Hash table size
-static constexpr uint32_t MIN_MATCH_LEN = 3;         // Minimum length for a match
-static constexpr uint32_t MAX_MATCH_LEN = 273;       // Max length (like LZMA)
+const size_t LZRC_WIN_SIZE = 1 << 15; // 32 KiB window
+const size_t LZRC_MIN_MATCH_LEN = 3;  // Minimum match length
+const size_t LZRC_MAX_MATCH_LEN = 258; // Max length of a match
 
 //---------------------------------------------------------------------------
 // Simple Adaptive Order-0 Model

@@ -1,9 +1,217 @@
 // =============== rangecoder.cpp ===============
-#include "rangecoder.h"
-#include <cassert>
-#include <stdexcept>
 #include <vector>
 #include <cstdint>
+#include <stdexcept> // For errors
+#include <cmath> // For std::log2 (if needed for real price calc)
+#include <limits>     // For numeric_limits
+#include <algorithm>  // For std::reverse, std::min
+#include <string>    // For std::to_string in error messages
+#include <cassert>   // For existing assert calls
+
+#include "rangecoder.h"
+
+namespace { // Anonymous namespace for helper structs and functions
+
+// Structure to store optimal path information
+struct Opt {
+    int price = std::numeric_limits<int>::max(); // total price to reach this position
+    uint16_t len = 0;  // length of token ending here (1 for literal, >= MIN_MATCH_LEN for match)
+    uint32_t dist = 0; // distance if match, 0 otherwise
+
+    // Default constructor initializes price to max
+    Opt() = default;
+
+    // Constructor for convenience
+    Opt(int p, uint16_t l, uint32_t d) : price(p), len(l), dist(d) {}
+};
+
+// Structure to represent a candidate match
+struct MatchCandidate {
+    uint32_t dist;
+    uint32_t len;
+};
+
+// --- Price Estimation ---
+
+// Helper: Estimate bits for a symbol given freq/total (scaled)
+const int PRICE_BITS_SHIFT = 8; // Scale factor for integer representation (e.g., 8 means cost is in units of 1/256 bits)
+
+int estimate_bits(uint16_t freq, uint16_t total) {
+    if (freq == 0 || total == 0 || freq > total) {
+         // Invalid input or zero probability, assign effectively infinite cost
+         // Divide by 2 to prevent overflow when summing multiple max costs
+         return std::numeric_limits<int>::max() / 2;
+    }
+    // Avoid log2(0) or log2(negative) which are undefined or complex.
+    // Freq is guaranteed > 0 here. Total is also > 0.
+
+    // Calculate bits: -log2(probability) = log2(total) - log2(freq)
+    // Use double for intermediate log2 calculation for precision
+    double log2_freq = std::log2(static_cast<double>(freq));
+    double log2_total = std::log2(static_cast<double>(total));
+    double bits = log2_total - log2_freq;
+
+    // Scale and convert to integer, ensuring non-negative result. Add 0.5 for rounding.
+    int scaled_bits = static_cast<int>(bits * (1 << PRICE_BITS_SHIFT) + 0.5);
+
+    // Ensure minimum cost is slightly > 0 to distinguish from impossible paths
+    // and avoid issues if scaling results in 0 for high-probability symbols.
+    return std::max(1, scaled_bits);
+}
+
+// Helper: Estimate bits for a varuint (using its byte model)
+int estimate_varuint_bits(uint32_t value, const rangecoder::ModelO0<256>& model) {
+    int total_cost = 0;
+    int max_cost_check = std::numeric_limits<int>::max() / 2; // Precompute limit
+
+    do {
+        uint8_t byte = value & 0x7F; // Get lower 7 bits
+        value >>= 7;
+        if (value > 0) {
+            byte |= 0x80; // Set continuation bit
+        }
+
+        // Estimate cost of this byte using the model
+        int byte_cost = estimate_bits(model.freq[byte], model.total);
+
+        // Check for potential overflow before adding
+        if (byte_cost >= max_cost_check || total_cost > max_cost_check - byte_cost) {
+             return max_cost_check; // Return max cost if overflow would occur or byte cost is max
+        }
+        total_cost += byte_cost;
+
+    } while (value > 0);
+
+    return total_cost;
+}
+
+// Get price for encoding a literal
+int get_literal_price(
+    uint8_t literal,
+    uint8_t context,
+    const rangecoder::ModelO0<2>& M_flag,
+    const rangecoder::ModelO1& M_lit)
+{
+    int max_cost_check = std::numeric_limits<int>::max() / 2;
+
+    // Cost of is_match=0 flag
+    int flag_cost = estimate_bits(M_flag.freq[0], M_flag.total);
+    if (flag_cost >= max_cost_check) return max_cost_check;
+
+    // Cost of the literal itself using the context model
+    int literal_cost = estimate_bits(M_lit.freq[context][literal], M_lit.cum[context][256]);
+     if (literal_cost >= max_cost_check) return max_cost_check;
+
+    // Return total cost, checking for overflow
+    if (flag_cost > max_cost_check - literal_cost) {
+        return max_cost_check;
+    }
+    return flag_cost + literal_cost;
+}
+
+// Get price for encoding a match
+int get_match_price(
+    uint32_t dist,
+    uint32_t len,
+    const rangecoder::ModelO0<2>& M_flag,
+    const rangecoder::ModelO0<256>& M_dist,
+    const rangecoder::ModelO0<256>& M_len)
+{
+     int max_cost_check = std::numeric_limits<int>::max() / 2;
+
+    // Cost of is_match=1 flag
+    int flag_cost = estimate_bits(M_flag.freq[1], M_flag.total);
+    if (flag_cost >= max_cost_check) return max_cost_check;
+
+    // Cost of distance (dist - 1)
+    uint32_t dist_val = dist - 1;
+    int dist_cost = estimate_varuint_bits(dist_val, M_dist);
+     if (dist_cost >= max_cost_check) return max_cost_check;
+
+    // Cost of length (len - min_match_len)
+    const size_t min_match_len = rangecoder::LZRC_MIN_MATCH_LEN;
+    if (len < min_match_len) { // Should not happen if find_all_matches is correct, but safety check
+         return max_cost_check;
+    }
+    uint32_t len_val = len - min_match_len;
+    int len_cost = estimate_varuint_bits(len_val, M_len);
+    if (len_cost >= max_cost_check) return max_cost_check;
+
+
+    // Return total cost, checking for overflow carefully
+    int total_cost = flag_cost;
+    if (total_cost > max_cost_check - dist_cost) return max_cost_check;
+    total_cost += dist_cost;
+    if (total_cost > max_cost_check - len_cost) return max_cost_check;
+    total_cost += len_cost;
+
+    return total_cost;
+}
+
+// --- Match Finding ---
+// Returns *all* valid matches found within the window.
+std::vector<MatchCandidate> find_all_matches(
+    const std::vector<uint8_t>& data, // Changed from raw to data for clarity
+    size_t current_pos,               // Changed from global_pos + pos
+    size_t data_size,                 // Changed from N
+    size_t window_size,               // Changed from win_size
+    size_t min_len,                   // Changed from min_match_len
+    size_t max_len)                   // Changed from max_match_len
+{
+    std::vector<MatchCandidate> candidates;
+    if (current_pos == 0) return candidates; // Cannot match at the beginning
+
+    // Ensure max_len doesn't exceed remaining data
+    max_len = std::min(max_len, data_size - current_pos);
+
+    if (max_len < min_len) return candidates; // Not enough data left for even min match
+
+    size_t search_start = (current_pos > window_size) ? (current_pos - window_size) : 0;
+
+    // --- Find all matches meeting min_len requirement ---
+    // Note: This can return many candidates. Real compressors often use heuristics
+    //       (e.g., keep N best, limit based on length/distance) to prune this list.
+    //       For now, we return all found matches.
+
+    const uint8_t* data_ptr = data.data(); // Use pointer for potential minor speedup
+    const uint8_t* current_ptr = data_ptr + current_pos;
+
+    // Search backwards from current_pos - 1
+    for (size_t match_start_idx = current_pos - 1; ; --match_start_idx) {
+        uint32_t current_match_len = 0;
+        const uint8_t* match_start_ptr = data_ptr + match_start_idx;
+
+        // Compare bytes using pointers
+        while (current_match_len < max_len &&
+               match_start_ptr[current_match_len] == current_ptr[current_match_len])
+        {
+            current_match_len++;
+        }
+
+        // If a valid match is found, add it to the candidates list
+        if (current_match_len >= min_len) {
+             uint32_t match_dist = static_cast<uint32_t>(current_pos - match_start_idx);
+             // Add this match candidate to the list
+             candidates.push_back({match_dist, static_cast<uint16_t>(current_match_len)});
+             // Optimization: If we find a match of maximum possible length *starting at this position*,
+             // any shorter match starting at the same position is redundant for optimal parse
+             // (since the longer one covers it and gives more options later).
+             // However, finding *multiple* matches starting at *different* positions is the goal.
+             // We don't break here, allowing shorter matches from further back to be found.
+        }
+
+        // Break condition needs to be checked *before* potential underflow if search_start is 0
+        if (match_start_idx == search_start) break;
+    }
+
+    // Optional: Sort candidates? (e.g., by length descending, then dist ascending)
+    // Might help subsequent processing, but not strictly necessary for correctness.
+    // std::sort(candidates.begin(), candidates.end(), [](const auto& a, const auto& b){ ... });
+
+    return candidates;
+}
+
+} // end anonymous namespace
 
 namespace rangecoder {
 
@@ -310,7 +518,7 @@ std::vector<uint8_t> decode_order1(const std::vector<uint8_t>& comp) {
 
 std::vector<uint8_t> encode_adaptive(const std::vector<uint8_t>& raw)
 {
-    ModelO1 M; // Initialized with Laplace smoothing
+    ModelO1 M; 
     std::vector<uint8_t> out;
     // Reserve rough estimate - adaptive should be smaller than raw
     out.reserve(raw.size() * 9 / 10 + 16); // Heuristic: 90% + small buffer
@@ -320,7 +528,7 @@ std::vector<uint8_t> encode_adaptive(const std::vector<uint8_t>& raw)
     be_write32(out, N);
 
     // --- Encode Payload ---
-    RangeEncoder enc(out); // Pass vector by reference
+    RangeEncoder enc(out); // Encoder writes directly to comp
     uint8_t ctx = 0;
     for (uint8_t sym : raw) {
         enc.encode(M.cum[ctx][sym], M.freq[ctx][sym], M.cum[ctx][256]);
@@ -375,6 +583,8 @@ std::vector<uint8_t> decode_adaptive(const std::vector<uint8_t>& comp)
         uint32_t total_freq_for_ctx = M.cum[ctx][256];
         if (total_freq_for_ctx == 0) {
              // Should not happen with Laplace smoothing init and rescaling >= 1
+             // If it *can* become zero after updates (unlikely with MAX_C limit), handle it.
+             // For now, assume it's an error state.
              throw std::runtime_error("Decoder model reached zero total frequency");
         }
 
@@ -465,98 +675,134 @@ uint32_t read_varuint(RangeDecoder& dec, ModelO0<256>& model) {
 // --- Implementations for encode_lzrc / decode_lzrc will go here --- 
 
 std::vector<uint8_t> encode_lzrc(const std::vector<uint8_t>& raw) {
-    if (raw.empty()) {
-        std::vector<uint8_t> header(4, 0); // Header only for empty input (N=0)
-        return header;
-    }
-
     std::vector<uint8_t> comp;
-    RangeEncoder enc(comp);
-
-    // Write original size N
     uint32_t N = raw.size();
-    be_write32(comp, N); // Prepend size
+    if (N == 0) return comp; // Return empty vector for empty input
 
-    // --- Initialize Models ---
-    ModelO0<2> M_flag;       // Model for is_match flag (0=literal, 1=match)
-    ModelO1 M_lit;          // Model for literals (context is previous byte)
-    ModelO0<256> M_dist;    // Model for distance VarUInt bytes
-    ModelO0<256> M_len;     // Model for length VarUInt bytes
+    // Reserve space and write header later (after encoder finishes)
+    comp.reserve(N / 2 + 4); // Initial guess + 4 bytes for header
 
-    uint8_t prev_byte = 0;  // Context for the very first byte
-    size_t pos = 0;         // Current position in raw data
+    // --- Initialize Models & Encoder ---
+    RangeEncoder enc(comp); // Encoder writes directly to comp
+    ModelO0<2> M_flag;
+    ModelO1 M_lit;
+    ModelO0<256> M_dist;
+    ModelO0<256> M_len;
 
-    while (pos < N) {
-        // --- Find Longest Match ---
-        uint32_t best_match_len = 0;
-        uint32_t best_match_dist = 0;
+    // Constants defined in rangecoder.h
+    const size_t min_match_len = rangecoder::LZRC_MIN_MATCH_LEN; // QUALIFIED
+    const size_t win_size = rangecoder::LZRC_WIN_SIZE;         // QUALIFIED
+    const size_t max_match_len = rangecoder::LZRC_MAX_MATCH_LEN;   // QUALIFIED
 
-        // Use constants with correct names and no prefix
-        size_t search_start = (pos > WIN_SIZE) ? (pos - WIN_SIZE) : 0; 
-        size_t max_possible_len = N - pos;
+    // --- Optimal Parsing Setup ---
+    const size_t block_len = 4096;
+    std::vector<Opt> opts(block_len + max_match_len + 1);
+    std::vector<MatchCandidate> chosen_tokens; // To store results of trace-back
 
-        // Search backwards from pos-1 down to search_start
-        // Use explicit check for pos > 0 before loop entry
-        if (pos > 0) { 
-            for (size_t match_start_idx = pos -1; ; --match_start_idx) {
-            
-                uint32_t current_match_len = 0;
-                // Compare bytes starting from match_start_idx and pos
-                while (current_match_len < max_possible_len &&
-                    raw[match_start_idx + current_match_len] == raw[pos + current_match_len])
-                {
-                    current_match_len++;
-                }
+    size_t global_pos = 0; // Position in the overall 'raw' buffer
 
-                // Check if this match is better (longer)
-                if (current_match_len > best_match_len) {
-                    best_match_len = current_match_len;
-                    best_match_dist = static_cast<uint32_t>(pos - match_start_idx); 
-                    // Optimization: If we found max possible length, no need to search further back
-                    if (best_match_len == max_possible_len) break;
-                }
+    while (global_pos < N) {
+        size_t current_block_len = std::min(block_len, N - global_pos);
+        const uint8_t* block_buf_start = raw.data() + global_pos; // Pointer to start of current block in raw
 
-                // Break condition needs to be checked *before* potential underflow
-                if (match_start_idx == search_start) break; 
+        // --- Reset DP state for the block ---
+        for (size_t i = 0; i <= current_block_len + max_match_len; ++i) {
+             opts[i] = Opt{}; // Use default constructor (sets price to max)
+        }
+        opts[0].price = 0; // Start node has zero cost
+
+        // --- Forward Pass (Fill DP Table) ---
+        for (size_t pos = 0; pos < current_block_len; ++pos) {
+            if (opts[pos].price == std::numeric_limits<int>::max()) continue; // Skip unreachable
+
+            int base_price = opts[pos].price;
+
+            // --- Evaluate Literal ---
+            uint8_t current_ctx = (global_pos + pos > 0) ? raw[global_pos + pos - 1] : 0; // Approx context
+            uint8_t current_literal = block_buf_start[pos];
+
+            int p_lit = base_price + get_literal_price(current_literal, current_ctx, M_flag, M_lit);
+            if (p_lit < opts[pos + 1].price) {
+                opts[pos + 1] = Opt(p_lit, 1, 0);
             }
+
+            // --- Evaluate Matches ---
+            std::vector<MatchCandidate> candidates = find_all_matches(
+                raw, global_pos + pos, N, win_size, min_match_len, max_match_len
+             );
+
+            for (const auto& match : candidates) {
+                if (pos + match.len < opts.size()) {
+                     int p_match = base_price + get_match_price(match.dist, match.len, M_flag, M_dist, M_len);
+                     if (p_match < opts[pos + match.len].price) {
+                         opts[pos + match.len] = Opt(p_match, static_cast<uint16_t>(match.len), match.dist);
+                     }
+                }
+            }
+        } // End forward pass
+
+        // --- Trace-back Pass ---
+        chosen_tokens.clear();
+        chosen_tokens.reserve(current_block_len);
+        size_t current_trace_pos = current_block_len; // Start trace from end of logical block
+
+        while (current_trace_pos > 0) {
+            const Opt& current_opt = opts[current_trace_pos];
+            if (current_opt.len == 0 || current_opt.price == std::numeric_limits<int>::max()) {
+                 // Add context to error message
+                 throw std::runtime_error("Optimal parse trace-back failed: Invalid state at block offset " + 
+                                          std::to_string(current_trace_pos) + " (global pos " + 
+                                          std::to_string(global_pos + current_trace_pos) + ")");
+            }
+
+            if (current_opt.len == 1) { // Literal
+                chosen_tokens.push_back({0, 1});
+            } else { // Match
+                chosen_tokens.push_back({current_opt.dist, current_opt.len});
+            }
+            current_trace_pos -= current_opt.len;
+        }
+        std::reverse(chosen_tokens.begin(), chosen_tokens.end());
+
+        // --- Encode Chosen Tokens ---
+        size_t block_pos_encoded = 0;
+        for (const auto& token : chosen_tokens) {
+             uint8_t context_byte = (global_pos + block_pos_encoded > 0) ? raw[global_pos + block_pos_encoded - 1] : 0;
+
+             if (token.dist == 0) { // Encode Literal
+                  uint8_t literal = raw[global_pos + block_pos_encoded];
+                  enc.encode(M_flag.cum[0], M_flag.freq[0], M_flag.total); M_flag.update(0);
+                  enc.encode(M_lit.cum[context_byte][literal], M_lit.freq[context_byte][literal], M_lit.cum[context_byte][256]); M_lit.update(context_byte, literal);
+                  block_pos_encoded += 1;
+             } else { // Encode Match
+                  uint32_t match_dist = token.dist;
+                  uint32_t match_len = token.len;
+                  enc.encode(M_flag.cum[1], M_flag.freq[1], M_flag.total); M_flag.update(1);
+                  internal::write_varuint(enc, M_dist, match_dist - 1);
+                  internal::write_varuint(enc, M_len, match_len - rangecoder::LZRC_MIN_MATCH_LEN); // QUALIFIED
+                  block_pos_encoded += match_len;
+             }
         }
 
-
-        // --- Encode ---
-        if (best_match_len >= MIN_MATCH_LEN) { 
-            // Encode Match Flag = 1 directly using M_flag
-            enc.encode(M_flag.cum[1], M_flag.freq[1], M_flag.total); 
-            M_flag.update(1);
-
-            // Encode distance and length using VarUInt helpers
-            internal::write_varuint(enc, M_dist, best_match_dist - 1);           
-            internal::write_varuint(enc, M_len, best_match_len - MIN_MATCH_LEN); 
-
-            // Update context for the *next* token based on the last byte of the match
-            prev_byte = raw[pos + best_match_len - 1];
-            pos += best_match_len; // Advance position
-
-        } else {
-            // Encode Literal
-            enc.encode(M_flag.cum[0], M_flag.freq[0], M_flag.total); 
-            M_flag.update(0);
-
-            uint8_t literal = raw[pos];
-            // Use prev_byte as context for the literal model
-            enc.encode(M_lit.cum[prev_byte][literal], M_lit.freq[prev_byte][literal], M_lit.cum[prev_byte][256]);
-            M_lit.update(prev_byte, literal); 
-
-            prev_byte = literal; 
-            pos++; 
+        if (block_pos_encoded != current_block_len) {
+             // Add more context to the error message
+             throw std::runtime_error("Optimal parse encoding mismatch: Encoded " + std::to_string(block_pos_encoded) + 
+                                      " bytes, expected " + std::to_string(current_block_len) + 
+                                      " in block starting at global pos " + std::to_string(global_pos));
         }
-    }
+        global_pos += current_block_len;
+        // TODO: Handle lookahead carry-over
+    } // End while (global_pos < N)
 
-    enc.flush(); 
+    enc.flush();
 
-    // Prepend the header size back (it was modified by RangeEncoder constructor)
-    be_write32(comp, N);
+    // --- Prepend Header ---
+    std::vector<uint8_t> final_comp;
+    final_comp.reserve(comp.size() + 4);
+    be_write32(final_comp, N);
+    final_comp.insert(final_comp.end(), comp.begin(), comp.end());
 
-    return comp;
+    return final_comp;
 }
 
 std::vector<uint8_t> decode_lzrc(const std::vector<uint8_t>& comp) {
@@ -603,7 +849,7 @@ std::vector<uint8_t> decode_lzrc(const std::vector<uint8_t>& comp) {
             uint32_t len_val = internal::read_varuint(dec, M_len);
 
             uint32_t match_dist = dist_val + 1;
-            uint32_t match_len = len_val + MIN_MATCH_LEN; 
+            uint32_t match_len = len_val + rangecoder::LZRC_MIN_MATCH_LEN; // QUALIFIED
 
             if (match_dist > raw.size()) {
                  throw std::runtime_error("Invalid match distance");

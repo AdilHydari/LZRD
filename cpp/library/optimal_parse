@@ -1,0 +1,506 @@
+LZA New Optimal Parse
+Oodle LZA has a new optimal parse.
+
+
+
+Hi! A few notes -
+
+Calling these parsers "optimal" is a historical convention. Early LZH's would implement an LZSS optimal parse, and then just apply a Huffman entropy coder to the result and not worry about the fact that it was no longer the optimal solution to the LZH parse. They kept the name "optimal" because the truly optimal parse of LZH is uncomputable (I've never even heard of a proposed algorithm to compute anything like it).
+
+The earliest attempt to do forward "optimal" parsing was Quantum by Dave Stafford (the original PAQ). It used an adaptive arithmetic coder and did what we would now call "flexible parsing" ; it evaluated costs a few steps ahead. 
+
+
+So, the big difference between the LZMA optimal parse that Bulat describes here, and the ones I've worked on is that I wanted to consider how current choices affect coding in the future.
+
+The LZMA algorithm is very local or greedy, in the sense that when it considers a decision, it only looks at the price to take the next step.
+
+The strongest effect is not from the statistical adaptation, but from the "last offset" for repeat matches. This can be pretty significant on highly structured data that have strong repeat-match properties.
+
+A common case is something like choosing between {len=3, offset=16} {len=5, offset=912}
+
+If you just look at current prices, the len=5 choice might seem slightly better. But if you look a few steps into the future, the len=3 case turns out to be cheaper because it loads a useful offset into the repeat-match state, which gets used a few decisions in the future.
+
+This is the idea for the "Chain N" parsers. They take an existing optimal parse, which provides costs to the end of the buffer, and they improve that parse by speculatively trying different decisions and computing how that decision affects the costs N steps into the future. 
+
+
+Another little note -
+
+when the size of your dynamic "state" is small, you can do a truly optimal parse using dynamic programming. If state is of size S it simply requires a table of size N*S.
+
+For example in LZ4 the current LRL affects code cost, so it breaks the simple LZSS parsing, but you can set S = 15 or so and you get truly optimal parsing. (this is ignoring the effects of very high LRL affecting code cost at the next 255 boundary)
+
+The problem is as soon as you introduce even one "repeat match", then S is too big, and just putting a max on the repeat offset doesn't seem to work. 
+
+
+
+And -
+
+My A* idea is an attempt to do something closer to true optimal parsing. It's a forward parse, and it explores the entire graph of all possible parses.
+
+The A* parse considers the way current decisions affect the future all the way to the end - not limited after N steps.
+
+Obviously this is intractable. The solution is to discard exploration of paths that cannot be better than the current best path by more than some threshold. The higher you set that threshold, the more approximate and faster the parse.
+
+For me this is a big improvement over the LZMA parse or my previous parsers, because it makes the error *bounded*. Previous optimal parsers could be an unbounded amount worse than truly optimal.
+
+The problem I ran into was that 95% of the time, I could set a pretty low error threshold and get path explorations that terminated quickly. But on some blocks there are too many parses that are similar in cost to the best parse, so the bound doesn't work well and they explode into the worst case complexity.
+
+I do believe it's a promising area for future work if anyone really ever cares. (IMO there are better places to spend CPU time in your encoder!)
+
+See for example :
+
+http://en.wikipedia.org/wiki/A*_search_algorithm
+and "Bounded Relaxation" 
+
+
+Also -
+
+LZMA state size depends on the settings for the # of bits in the contexts.
+
+With default settings it can fit in less than 16k.
+
+There's a small mistake in LZMA -
+
+http://cbloomrants.blogspot.com/2014...lzma-like.html
+
+those fixes reduce the # of contexts required somewhat.
+
+In my A* I do not include the statistical state in the graph. A node is labelled by {state,pos} where "state" only includes the rep match offsets and a few bits similar to the LZMA "markov chain". The node label has to be small enough to be usable as a hash index for the dynamic programming. It's also useful to collapse that state as much as possible, so that paths come back together. In practice this reduces the branching factor enormously on most files.
+
+Lastly I should note that improvements beyond the LZMA-style parse are not very fruitful. The LZMA-style seems to be a very good tradeoff. My parsers are much slower for not much more compression. 
+
+
+
+
+
+
+
+    I implemented Bulat's idea for parsing with statistics moving forward.
+
+    That is, when you arrive at position "pos" you know the best way to arrive there, so you go back to the source of the best arrival and bring the statistics forward from there.
+
+    My LZA :
+
+    24700820 uncompressed
+    9267278 statistics carried forward (Bulat) (LZMA-style parse)
+    9315794 statistics updated only on 16k chunk boundaries (LZMA-style parse)
+
+    for reference :
+    9290222 old chain-N optimal parse at lowest level
+    9431777 7zip high profile 
+
+
+I just found a nice compromise.
+
+For reference :
+
+9267278 statistics carried forward (Bulat) (LZMA-style parse)
+9315794 statistics updated only on 16k chunk boundaries (LZMA-style parse)
+
+with 4k chunks : 9306334
+
+But it occurred to me that instead of just cutting at 4k to do a statistics update, I could let that boundary be flexible. Instead I wait to cut until there's no decisions in the parse. This occurs at either a literal (no matches cross a location) or a long enough match (due to fast-bytes still forced taking of long matches).
+
+with 4k flexible cut : 9299690
+
+But the real advantage of the flexible cut is that there's no penalty for making the update interval smaller. In fact you can make it as small as 1 byte!
+
+So the procedure is :
+
+Set prices from current statistics
+Parse ahead Bulat/LZMA style using current prices
+parse ahead stops when it hits a no-decision point
+reverse parse & output codes, updating statistics
+
+with small flexible cut : 9276018
+
+In practice I think you want a tiny minimum parse-ahead distance, because there is a little bit of cpu overhead in switching modes between parsing and outputting, so you don't want to actually do it on every byte when you're in a chunk of literals. 
+
+
+
+
+A few more notes.
+
+I tried enhancing this parse by doing a "chain-N" reparse on the forward output step.
+
+So the process is :
+
+LZMA-style parse forward to best arrival costs
+reverse parse
+change "cost from start" to "cost to end"
+reparse forward with chain-N instead of just outputting the previously found parse.
+
+
+It didn't work. I'm not entirely sure why. I had to increase N (of chain-N) to 4 before I got any improvement over the previous, and by then it's getting quite slow.
+
+My suspicion is because the LZMA-style parse is optimal from the start but is not optimal costs to the end, which is what chain-N needs. I'm not sure.
+
+Anyway I thought of something better which is next... 
+
+
+There's an improvement which scales nicely and fits within the framework of this parse.
+
+Instead of just storing the 1 cheapest way to arrive at each position, store N ways to arrive. Just storing the N cheapest ways to arrive seems to work pretty well (*).
+
+Then when you're costing outputs from the position, instead of just using the one arrival state, try all N arrivals.
+
+One of the arrivals that is not cheapest might wind up being a cheaper way to get into the future, because it has more useful repeat matches or something.
+
+Basically this lets the parse be less greedy. The original Bulat/LZMA parse is greedy in that you can never take a more expensive step in order to find a cheaper future step. This way gives you a little chance to do that.
+
+At each position you need N times the storage for the parse (what match did you choose, what position did you come from). You also have to store which of the N arrivals you came from. Then when you walk backwards, you trace back through the N different choices at each position.
+
+You can think of the position being augmented with a decimal place like {pos.arrival} ; then you just reverse those links and walk back through it forward to output, as before.
+
+The speed is not N times worse because most of the work at each position can be reused. (the normal matches are the same for all arrivals, it's just the repeat matches that change)
+
+One note :
+
+with this style of parse, the chunks can no longer be arbitrarily small.
+
+The reason is when you flush a chunk, you make a definite decision about which path through the arrivals you take. The multiple possible paths collapse down to one chosen path, you update the statistics, and at the end of the chunk have only 1 arrival to start from.
+
+I found the optimal flush length to be around 256, which balances keeping the statistics up to date vs. keeping your parse choice open for a while. 
+
+
+
+Results :
+
+Fez_Essentials.pak original 17784477
+
+lzma best : 10319525
+
+my old best parse ;
+backward-forward parse with chain-4 : 9739717
+
+Bulat/LZMA forward parse, 1 best arrival : 9780036
+Bulat/LZMA forward parse, 4 arrivals : 9512780
+
+Woot! 
+
+
+
+I just had a look in the LZMA code and want to write down what I saw.
+
+(I could be wrong; it's hard to follow!)
+
+The way execution flows in LZMA is pretty weird, it jumps around :
+
+The outer loop is for the encoding position.
+At each encoding position, he asks for the result of the optimal parse ahead.
+The optimal parse ahead caches results found in some sliding window ahead.
+If the current pos is in the window, return it, else fill a new window.
+
+To fill a window :
+find matches at current position.
+set window_len = longest match length
+fill costs going forward as described by Bulat above
+as you go forward, if a match length crosses past window_len, extend the window
+if window reaches "fast bytes" then break out
+when you reach the end of the window, reverse the parse and fill the cache
+now you can return the parse result at the base position of the window
+
+
+So, some notes :
+
+1. LZMA in fact does do the things that I proposed earlier - it updates statistics as soon as it hits a choke point in the parse.
+The optimal-parse-ahead window is not always "fast bytes". That's a maximum. It can also stop any time there are no matches crossing a place, just as I proposed earlier.
+
+2. LZMA caches the code costs ("prices") of match lengths and offsets, and updates them periodically. The match flags and literals are priced on the fly using the latest encoded statistics, so they are quite fresh.
+
+3. LZMA only stores 1 arrival. As I noted previously this has the drawback of missing out on some non-greedy steps. *However* and this is something I finally appreciate - LZMA also considers some multi-operation steps.
+
+LZMA considers the price to go forward using :
+literal
+rep matches
+normal matches
+
+If you stored all arrivals, that's all you need to consider and it would find the true optimal parse. But LZMA also considers :
+
+literal + rep0 match
+rep + literal + rep0
+normal match + literal + rep0
+
+These are sort of redundant in that they can be made from the things we already considered, but they help with the 1 arrivals problem. In particular they let you carry forward a useful offset that might not be the cheapest arrival otherwise.
+
+( literal + rep0 match is only tested if pos+1 's cheapest arrival is not a literal from the current pos )
+
+That is, it's explicitly including "gap matches" in the code cost as a way of finding slightly-non-local-minima. 
+
+
+
+A little more looking at LZMA.
+
+1. LZMA can store a direct arrival or a multi-step arrival. This is the prev2 business.
+
+(I was trying to figure out how to implement a multi-step arrival, like considering match+literal+rep ; the problem is if you try to store that up ahead at parse[match_len+1+rep_len] using only one arrival, then there might not be a path back that takes you through those states. eg. the cheapest state at parse[match_len+1] might come from somewhere else by the time you do the backwards trace. The solution is to explicitly store the multi-step arrival in a separate channel so that you can get it back.)
+
+2. LZMA defers a lot of the work of figuring out the arrival state until you actually arrive there. It doesn't update the markov history or reps or various things. They get figured out at the arrival. This is a speed win because you only arrive once but you might fill the same state many times.
+
+3. LZMA fills all lengths. That is, if you find a match_len, it also fills the arrival at match_len-1, match_len-2, etc. I've done a lot of testing that indicates this is not necessary. There's very little compression gain from doing all lengths. However if your code cost is well optimized t
+
+Thanks to Bulat Ziganshin for explaining the LZMA-style parse in a way that I could finally understand it.
+
+This style of parse is also described in the paper "Bit-Optimal Lempel-Ziv compression".
+
+Some previous rants on the topic :
+
+cbloom rants 10-10-08 - 7
+cbloom rants 01-09-12 - LZ Optimal Parse with A Star Part 5
+cbloom rants 09-04-12 - LZ4 Optimal Parse
+cbloom rants 09-11-12 - LZ MinMatchLen and Parse Strategies
+cbloom rants 09-24-12 - LZ String Matcher Decision Tree
+cbloom rants 06-12-14 - Some LZMA Notes
+cbloom rants 06-16-14 - Rep0 Exclusion in LZMA-like coders
+cbloom rants 06-21-14 - Suffix Trie Note
+
+I should note that the advantage of this optimal parse over my previous LZA optimal parse (backward-forward-chain-N) is that it can achieve roughly the same compression in much less time. The chain-N forward parse can get more compression if N is increased, but the time taken is exponential in N, so it becomes very slow for N over 2, and N over 4 is unusable in practice.
+
+New LZA Optimal level 1 (-z5) uses the straightforward version of this parse. I flush the parse to update statistics any time there are no matches that cross a position (either because no match is possible, or a long match is possible in which case I force it to be chosen, ala LZMA). This looks like :
+
+New LZA Optimal level 2 (-z6) stores the 4 cheapest arrivals to each position. This allows you to arrive from a previous parse which was not the cheapest on its prior subgraph, but results in a cheaper total parse to your current subgraph. You get this sort of braided 4-line thing.
+
+When you flush the parse to output codes and update statistics, you choose one specific path through the parse. You trace it backwards from the end point, because you have arrivals, then you reverse it to output the codes.
+
+Here's a drawing showing the trace backwards to flush the parse after it's been filled out :
+
+At the flush pos, you take arrival slot 0 (the cheapest) and discard the other arrivals. When you resume from that spot to continue the parse you must resume from only slot 0. It sort of reminds me of the earlier QM post - the parse is uncertain, not set, with these 4 different realities that are possible at each position, until you make a Copenhagen measurement and actually flush the parse, at which point the alternative histories are discarded and you snap to just one. When you resume the parse, the number of arrivals very rapidly grows from 1 up to the maximum of 4, and then stays at 4 through the parse until you snap back to 0.
+
+Unlike the level 1 parse, I do not sync at unambiguous points because you want to keep the possibilities alive for a while. There's a tradeoff between up-to-date statistics and longer flexible parse intervals. (the reason this tradeoff exists is that I don't bring the statistics forward in the parse, though it is possible to do as described by Bulat, my tests indicate it's not worth the speed & memory use hit).
+
+I'm going to show some prints of an actual parse. The columns are the 4 arrivals, and positions increase going down.
+
+The first number is how many positions steps back to your previous point, and the next number is which thread (arrival context) you came from at that position.
+
+So a literal is step back 1 :
+
+
+  1|0   1|1   1|2   1|3
+  1|0   1|1   1|2   1|3
+  1|0   1|1   1|2   1|3
+
+This is a chunk of parse where only literals are possible, and the costs are about the same in each context so the states just carry forward.
+
+
+  1|0   1|1   1|2   1|3
+  1|0   1|2   1|1   1|3
+  1|0   1|1   1|2   1|3
+
+Literals don't always just carry forward, because the cost to code a literal depends on the last-offset context which can be different in each arrival. Here threads 1 & 2 swapped because of literal cost differences.
+
+Through the vast majority of the parse, slot 0 (cheapest) arrives from slot 0. Through all that range, the alternate parses are playing no role. But once in a while they swap threads. Here's an example with the trace-back highlighted :
+
+
+ [3|0]  3|1   3|2   1|0
+ [1|0]  1|1   1|2   1|3
+ [1|0]  1|1   1|2   1|3
+  1|0   1|1   1|2   1|3
+  1|0   1|1   1|2   1|3
+  1|0   1|1   1|2   1|3
+  1|0   1|1   1|2   1|3
+  1|0   1|1   1|2   1|3
+  5|0  [6|0]  5|1   6|1
+  1|0   1|1   1|2   1|3
+  1|0   1|1   1|2   1|3
+  1|0   1|1   1|2   1|3
+  1|0   1|2   1|1   1|3
+  1|0   1|1   1|2   1|3
+  1|0   1|1   1|2   1|3
+  1|0   1|1   1|2   1|3
+  8|0  [8|1]  8|2   8|3
+  1|0   1|1   1|2   1|3
+  1|0   1|1   1|2   1|3
+  1|0   1|1   1|2   1|3
+  4|0  [4|1]  4|2   4|3
+  1|0  [1|1]  1|2   1|3
+  1|0   1|1   1|2   1|3
+  1|0   1|1   1|2   1|3
+  3|0  [3|1]  3|2   3|3
+  1|0  [1|1]  1|2   1|3
+  1|0   1|1   1|2   1|3
+  1|0   1|1   1|2   1|3
+  1|0   1|1   1|2   1|3
+  1|0   1|1   1|2   1|3
+  1|0   1|1   1|2   1|3
+  1|0   1|1   1|2   1|3
+ [7|1]  7|3   7|0   7|2
+
+If the last pos there was a flush point, that would be the parse we trace back to output. Remember that the length is not the length coded at that pos, but the length to *arrive* at that pos (the length coded at the previous pos).
+
+A more detailed printout showing how this type of thing happens. Here I'm also printing match vs. last-offset match, and the offset used in the match :
+
+
+ [4L+708|0] 3L+708|0  4L+708|1  4L+708|2
+ [1 +  0|0] 1 +  0|1  1 +  0|2  1 +  0|3
+  1 +  0|0  1 +  0|1  1 +  0|2  1 +  0|3
+  1 +  0|0  1 +  0|1  1 +  0|2  1 +  0|3
+ [3L+708|0] 3L+708|1  3L+708|2  3L+708|3
+  1 +  0|0  1 +  0|1  1 +  0|2  1 +  0|3
+  1 +  0|0  1 +  0|1  1 +  0|2  1 +  0|3
+  1 +  0|0  1 +  0|1  1 +  0|2  1 +  0|3
+ [4M+228|0] 4M+228|1  4M+228|2  3M+228|0
+  1 +  0|0  1 +  0|1  1 +  0|3  1 +  0|2
+  1 +  0|0  1 +  0|1  1 +  0|2  1 +  0|3
+  1 +  0|0  1 +  0|1  1 +  0|2  1 +  0|3
+ [4M+732|0] 4M+732|1  1 +  0|0  3M+732|0
+ [1 +  0|0] 1 +  0|1  1 +  0|2  1 +  0|3
+  1 +  0|0  1 +  0|1  1 +  0|3  1 +  0|2
+  1 +  0|0  1 +  0|1  1 +  0|3  1 +  0|2
+  4M+ 12|0 [3L+732|0] 5L+ 12|0  4L+ 12|2
+  1 +  0|0  1 +  0|1  1 +  0|2  1 +  0|3
+  1 +  0|0  1 +  0|1  1 +  0|2  1 +  0|3
+  1 +  0|0  1 +  0|1  1 +  0|2  1 +  0|3
+  4M+252|0 [4M+252|1] 4M+252|2  4M+252|3
+  1 +  0|0  1 +  0|1  1 +  0|2  1 +  0|3
+  1 +  0|0  1 +  0|1  1 +  0|2  1 +  0|3
+  1 +  0|0  1 +  0|1  1 +  0|2  1 +  0|3
+ [4L+708|1] 4L+708|2  4L+708|3  4M+708|0
+
+In the last position here we want to code a match of length 4 at offset 708. Arrivals 1-3 can code it as a last-offset, but arrival 0 (the cheapest) does not have 708 in the last-offset set (because it previously coded 252,12,732,228 and knocked the 708 out of its history).
+
+You can see way back in the past 708 was used twice, and threads 1-3 only used three other offsets (my last-offset set keeps four offsets) so they still have 708.
+
+This is really what the multiple arrivals is all about. You get an extremely non-local effect, that by keeping that 708 in the last offset set, you get a cheaper parse way off in the future when it's used again.
+
+Another one because I find this amusing :
+
+
+  1 +  0|0  1 +  0|1  1 +  0|2  1 +  0|3
+ 15M+360|0 12M+360|0[16M+720|0]12M+360|1
+  1 +  0|0 [1 +  0|2] 1 +  0|1  1 +  0|3
+ [1 +  0|1] 1 +  0|0  1 +  0|2  1 +  0|3
+ [1 +  0|0] 1 +  0|1  1 +  0|2  1 +  0|3
+
+What's happened here is the literal coding is cheaper with offset 720 as the last-offset. It's not until two literals later that it becomes the winner. The first literal after the match uses LAM exclusion, and then the next literal after that uses LAM as coding context. ( as described here )
+
+I've been highlighting interesting bits of parse. It should be noted that the vast majority of every parse is just staying on the channel-0 (cheapest) thread. Like this :
+
+
+     1688: [  1 +  0|0]   1 +  0|1    1 +  0|2    1 +  0|3 
+     1689: [  1 +  0|0]   1 +  0|1    1 +  0|2    1 +  0|3 
+     1690: [  1 +  0|0]   1 +  0|1    1 +  0|2    1 +  0|3 
+     1691: [  1 +  0|0]   1 +  0|1    1 +  0|2    1 +  0|3 
+     1692: [  1 +  0|0]   1 +  0|1    1 +  0|2    1 +  0|3 
+     1693: [  1 +  0|0]   1 +  0|1    1 +  0|2    1 +  0|3 
+     1694: [  1 +  0|0]   1 +  0|1    1 +  0|2    1 +  0|3 
+     1695:    1 +  0|0    1 +  0|1    1 +  0|2    1 +  0|3 
+     1696:    1 +  0|0    1 +  0|1    1 +  0|2    1 +  0|3 
+     1697: [  3M+167|0]   3M+167|1    3M+167|2    1 +  0|0 
+     1698:    1 +  0|0    1 +  0|1    1 +  0|2    1 +  0|3 
+     1699:    1 +  0|0    1 +  0|1    1 +  0|2    1 +  0|3 
+     1700: [  3M+ 45|0]   4M+ 45|0    3M+ 45|1    3M+ 45|2 
+     1701:    1 +  0|0    1 +  0|1    1 +  0|2    1 +  0|3 
+     1702:    1 +  0|0    1 +  0|1    1 +  0|2    1 +  0|3 
+     1703:    1 +  0|0    1 +  0|1    1 +  0|2    1 +  0|3 
+     1704:    1 +  0|0    1 +  0|1    1 +  0|2    1 +  0|3 
+     1705:    3M+ 55|0    3M+ 55|1    3M+ 55|2    3M+ 55|3 
+     1706:    6M+ 58|0    6M+ 58|1    6M+ 58|2    6M+ 58|3 
+     1707:    7M+251|0    7M+251|1    1 +  0|0    1 +  0|1 
+     1708: [  8M+330|0]   8M+330|1    8M+330|2    1 +  0|0 
+     1709:    1 +  0|0    1 +  0|1    1 +  0|2    1 +  0|3 
+     1710:    1 +  0|0    1 +  0|1    1 +  0|2    1 +  0|3 
+     1711:    1 +  0|0    1 +  0|1    1 +  0|2    1 +  0|3 
+
+Anyway, here's one I spotted which exhibits unusual jumping around :
+
+
+     3642: [  4L+612|0]
+     3643: [  1 +  0|0]
+     3644: [  1 +  0|0]
+     3645: [  1 +  0|0]
+     3646: [  1 +  0|0]
+     3647: [  1 +  0|0]
+     3648:    1 +  0|0 
+     3649:    1 +  0|0 
+     3650: [  3M+192|0]   1 +  0|0 
+     3651:    1 +  0|0    1 +  0|1 
+     3652:    1 +  0|0    1 +  0|1 
+     3653:    1 +  0|0    1 +  0|1 
+     3654:    5L+ 12|0 [  4M+ 12|0]   4L+ 12|1    3M+ 12|0 
+     3655:    1 +  0|0 [  1 +  0|1]   1 +  0|2    1 +  0|3 
+     3656:    1 +  0|0    1 +  0|1    1 +  0|2    1 +  0|3 
+     3657:    1 +  0|0    1 +  0|1    1 +  0|2    1 +  0|3 
+     3658:    3L+612|0 [  3L+612|1]   3L+612|2    3L+612|3 
+     3659:    1 +  0|0 [  1 +  0|1]   1 +  0|2    1 +  0|3 
+     3660:    1 +  0|0    1 +  0|1    1 +  0|2    1 +  0|3 
+     3661:    1 +  0|0    1 +  0|1    1 +  0|2    1 +  0|3 
+     3662:    3L+228|0 [  3L+192|1]   3L+228|2    3L+192|3 
+     3663:    1 +  0|0 [  1 +  0|1]   1 +  0|2    1 +  0|3 
+     3664:    1 +  0|0    1 +  0|2    1 +  0|1    1 +  0|3 
+     3665:    1 +  0|0    1 +  0|2    1 +  0|1    1 +  0|3 
+     3666:    3L+228|0    4M+624|0    4M+624|1 [  3L+612|1]
+     3667:    1 +  0|0    1 +  0|1 [  1 +  0|3]   1 +  0|2 
+     3668:    1 +  0|0    1 +  0|1    1 +  0|3    1 +  0|2 
+     3669:    1 +  0|0    1 +  0|1    1 +  0|3    1 +  0|2 
+     3670:    3M+576|0    3M+576|1 [  3M+576|2]   3M+576|3 
+     3671:    1 +  0|0    1 +  0|1 [  1 +  0|2]   1 +  0|3 
+     3672:    1 +  0|0    1 +  0|1    1 +  0|2    1 +  0|3 
+     3673:    1 +  0|0    1 +  0|1    1 +  0|2    1 +  0|3 
+     3674: [  3L+192|2]   3L+192|3    3M+192|0    3M+192|1 
+     3675:    1 +  0|0    1 +  0|1    1 +  0|2    1 +  0|3 
+     3676:    1 +  0|0    1 +  0|1    1 +  0|2    1 +  0|3 
+     3677:    1 +  0|0    1 +  0|1    1 +  0|2    1 +  0|3 
+     3678: [  4L+ 12|0]   4M+ 12|1    3L+ 12|0    3L+624|1 
+
+All the previous examples have been from highly structured binary files. Here's an example on text :
+
+
+     1527: [  1 +  0|0]   1 +  0|1    1 +  0|2    1 +  0|3 
+     1528:    1 +  0|0    1 +  0|1    1 +  0|2    1 +  0|3 
+     1529:    1 +  0|0    1 +  0|1    1 +  0|2    1 +  0|3 
+     1530:    1 +  0|0    1 +  0|1    1 +  0|2    1 +  0|3 
+     1531: [  4M+100|0]   4M+100|1    4M+100|2    4M+100|3 
+     1532:    1 +  0|0    1 +  0|1    1 +  0|2    1 +  0|3 
+     1533:    1 +  0|0    1 +  0|1    1 +  0|2    1 +  0|3 
+     1534:    1 +  0|0    1 +  0|1    1 +  0|2    1 +  0|3 
+     1535:    1 +  0|0    1 +  0|1    1 +  0|2    1 +  0|3 
+     1536:    1 +  0|0    1 +  0|1    1 +  0|2    1 +  0|3 
+     1537:    1 +  0|0    1 +  0|1    1 +  0|2    1 +  0|3 
+     1538:    1 +  0|0    1 +  0|1    1 +  0|2    1 +  0|3 
+     1539:   10M+ 32|0   10M+ 32|1 [  8M+ 32|0]   8M+ 32|1 
+     1540:    1 +  0|0    1 +  0|1    1 +  0|2    1 +  0|3 
+     1541:    1 +  0|0    1 +  0|1    1 +  0|2    1 +  0|3 
+     1542:    1 +  0|0    1 +  0|1    1 +  0|2    1 +  0|3 
+     1543:    3M+ 47|0    3M+ 47|1    3M+ 47|2    3M+ 47|3 
+     1544:    1 +  0|0    1 +  0|1    1 +  0|2    1 +  0|3 
+     1545:    5M+ 49|0    5M+ 49|1    5M+ 49|2    5M+ 49|3 
+     1546:    5M+  1|0    5M+  1|1    5M+  1|2    5M+  1|3 
+     1547:    8M+ 50|0 [  8M+ 50|2]   8M+ 50|1    8M+ 50|3 
+     1548:    1 +  0|0 [  1 +  0|1]   1 +  0|2    1 +  0|3 
+     1549:    1 +  0|0    1 +  0|1    1 +  0|2    1 +  0|3 
+     1550: [  2L+999|1]   2L+999|3    2L+999|0    2L+999|2 
+     1551: [  1 +  0|0]   1 +  0|1    1 +  0|2    1 +  0|3 
+     1552: [  1 +  0|0]   1 +  0|1    1 +  0|2    1 +  0|3 
+
+The benefit of the N-arrival parse is far far lower on text than on binary.
+
+
+text :
+
+enwik8 -z5 : 25384698
+enwik8 -z6 : 25358366
+
+binary :
+
+fez_essentials -z5 : 9780036
+fez_essentials -z6 : 9512780
+
+lzt02 -z5 : 146098
+lzt02 -z6 : 141141
+
+lzt25 -z5 : 63376
+lzt25 -z6 : 56982
+
+Some random notes :
+
+In LZA I do not have the N^2 problem like Tornado. For each match, I only consider the maximum possible match length. The reason I can do this is because I enforce strict LAM exclusion. Shorter lengths are not allowed because they would not exclude the LAM.
+
+This is not an "optimal" parse in the sense of being exactly right. To be a true optimal parse, you would have to carry the statistics forward through the tree, and you would have to store *all* arrivals to a given position, not just the best 4.
+
+The A-Star parse I previously wrote about is pretty similar to this actually. Rather than only store 4 arrivals at each position, it can store an unbounded # of arrivals, and it tries to discard paths that cannot ever beat the best path (with a fuzzy tolerance to make that viable).
+
+Storing the 4 cheapest arrivals is maybe not right. You want the 1 cheapest, but then what you want for the other 3 is for them to be interesting alternatives. For example you want their last-offset set to be different than the cheapest arrival, you don't just want a more expensive way to wind up with the same thing. I've done some limited experiments with this but haven't found anything definitive yet.
+
+There's also the issue of deciding when to reset the statistical state.
+
+Because statistics aren't carried forward, there's the issue of parse-statistics feedback. In particular, some hueristic guidance does help (like don't ever take a normal match when a longer repeat-match is possible). Also if the beginning of the file is unusual, it can lead you into a bad local minimum. 
